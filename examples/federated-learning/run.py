@@ -17,50 +17,45 @@ session_target = sys.argv[2] if len(sys.argv) > 2 else None
 
 class ModelOwner:
 
-    LEARNING_RATE = 0.1
     ITERATIONS = 60000 // 30
 
     def __init__(self, player_name):
         self.player_name = player_name
 
-        with tf.device(tfe.get_config().get_player(player_name).device_name):
-            self._initialize_weights()
-
-    def _initialize_weights(self):
-        with tf.name_scope('parameters'):
-            self.w0 = tf.Variable(tf.random_normal([28 * 28, 512]))
-            self.b0 = tf.Variable(tf.zeros([512]))
-            self.w1 = tf.Variable(tf.random_normal([512, 10]))
-            self.b1 = tf.Variable(tf.zeros([10]))
-
-    def _build_model(self, x, y):
-        w0 = self.w0.read_value()
-        b0 = self.b0.read_value()
-        w1 = self.w1.read_value()
-        b1 = self.b1.read_value()
-        params = (w0, b0, w1, b1)
-
-        layer0 = tf.matmul(x, w0) + b0
-        layer1 = tf.nn.sigmoid(layer0)
-        layer2 = tf.matmul(layer1, w1) + b1
-        predictions = layer2
-
-        loss = tf.reduce_mean(tf.losses.sparse_softmax_cross_entropy(logits=predictions, labels=y))
-        grads = tf.gradients(ys=loss, xs=params)
-        return predictions, loss, grads
+    def _build_model(self):
+        model = tf.keras.models.Sequential([
+            tf.keras.layers.Flatten(input_shape=(28, 28)),
+            tf.keras.layers.Dense(128, activation='relu'),
+            tf.keras.layers.Dropout(0.2),
+            tf.keras.layers.Dense(10, activation='softmax'),
+        ])
+        return model
 
     def build_training_model(self, x, y):
         """
         This method will be called once by all data owners
         to create a local gradient computation on their machine.
         """
-        _, _, grads = self._build_model(x, y)
+
+        model = self._build_model()
+
+        model.compile(optimizer='adam',
+                      loss='sparse_categorical_crossentropy',
+                      metrics=['accuracy'])
+
+        loss = model.loss_functions[0]
+
+        with tf.GradientTape() as tape:
+            y_pred = model(x)
+            loss_value = loss(y, y_pred)
+
+        grads = tape.gradient(loss_value, model.trainable_variables)
         return grads
 
-    def _build_validation_model(self, x, y):
-        predictions, loss, _ = self._build_model(x, y)
-        most_likely = tf.argmax(predictions, axis=1)
-        return most_likely, loss
+    # def _build_validation_model(self, x, y):
+    #     predictions, loss, _ = self._build_model(x, y)
+    #     most_likely = tf.argmax(predictions, axis=1)
+    #     return most_likely, loss
 
     def _build_data_pipeline(self):
 
@@ -79,30 +74,30 @@ class ModelOwner:
         return iterator.get_next()
 
     def update_model(self, *grads):
-        params = [self.w0, self.b0, self.w1, self.b1]
         grads = [tf.cast(grad, tf.float32) for grad in grads]
+        
+        model = self._build_model()
+        optimizer = model.optimizer
+        
         with tf.name_scope('update'):
-            update_op = tf.group(*[
-                param.assign(param - grad * self.LEARNING_RATE)
-                for param, grad in zip(params, grads)
-            ])
-            # return update_op
+            update_op = optimizer.apply_gradients(zip(grads, model.trainable_variables))
+            return update_op
 
-        with tf.name_scope('validate'):
-            x, y = self._build_data_pipeline()
-            y_hat, loss = self._build_validation_model(x, y)
+        # with tf.name_scope('validate'):
+        #     x, y = self._build_data_pipeline()
+        #     y_hat, loss = self._build_validation_model(x, y)
 
-            with tf.control_dependencies([update_op]):
-                return tf.print('expect', loss, y, y_hat, summarize=50)
+        #     with tf.control_dependencies([update_op]):
+        #         return tf.print('expect', loss, y, y_hat, summarize=50)
 
 
 class DataOwner:
 
     BATCH_SIZE = 30
 
-    def __init__(self, player_name, build_training_model):
+    def __init__(self, player_name, _training_model):
         self.player_name = player_name
-        self._build_training_model = build_training_model
+        self._training_model = _training_model
 
     def _build_data_pipeline(self):
 
@@ -125,7 +120,8 @@ class DataOwner:
             x, y = self._build_data_pipeline()
 
         with tf.name_scope('gradient_computation'):
-            grads = self._build_training_model(x, y)
+            with tf.variable_scope(self.player_name):
+                grads = self._training_model(x, y)
 
         return grads
 
