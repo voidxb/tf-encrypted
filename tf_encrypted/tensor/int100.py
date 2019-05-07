@@ -1,746 +1,312 @@
-"""High-precision tensors that implement a fixed-point representation with
-an array of backing tensors with lower precision conforming to the Chinese
-remainder theorem.
-
-Currently, we only use the CRT for an int100 tensor, although other
-high-precision tensor types are possible."""
-from __future__ import absolute_import
-from typing import Union, Optional, List, Tuple
-from functools import reduce, partial
-import abc
+"""The TF Encrypted Config abstraction and its implementations."""
+from abc import ABC, abstractmethod
+from collections import OrderedDict
+import json
+import logging
 import math
+from pathlib import Path
 
-import numpy as np
 import tensorflow as tf
+from tensorflow.core.protobuf import rewriter_config_pb2
 
-from .helpers import prod, inverse
-from .factory import (
-    AbstractFactory, AbstractTensor, AbstractVariable,
-    AbstractConstant, AbstractPlaceholder
-)
-from .shared import binarize, conv2d, im2col
-from ..operations import secure_random
+from .player import Player
 
 
-def crt_factory(int_type, moduli):
-  """Chinese remainder theorem tensor factory."""
+logging.basicConfig()
+logger = logging.getLogger('tf_encrypted')
+logger.setLevel(logging.DEBUG)
 
-  matmul_threshold = 1024
 
-  modulus = prod(moduli)
-  bitsize = math.ceil(math.log2(modulus))
+def tensorflow_supports_int64():
+  """Test if int64 is supported by this build of TensorFlow. Hacky."""
+  with tf.Graph().as_default():
+    x = tf.constant([1], shape=(1, 1), dtype=tf.int64)
+    try:
+      tf.matmul(x, x)
+    except TypeError:
+      return False
+    return True
 
-  # make sure we have room for lazy reductions:
-  # - 1 multiplication followed by 1024 additions
-  for mi in moduli:
-    assert 2 * math.log2(mi) + math.log2(1024) < math.log2(int_type.max)
 
-  #
-  # methods benefitting from precomputation
-  #
+def _get_docker_cpu_quota():
+  """
+  Checks for available cpu cores in a containerized environment.
 
-  def gen_crt_recombine_lagrange():
+  If you witness memory leaks while doing multiple predictions using docker
+  see https://github.com/tensorflow/tensorflow/issues/22098.
+  """
+  cpu_cores = None
 
-    # precomputation
-    n = [modulus // mi for mi in moduli]
-    lambdas = [ni * inverse(ni, mi) % modulus for ni, mi in zip(n, moduli)]
+  # Check for quotas if we are in a linux container
+  cfs_period = Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+  cfs_quota = Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
 
-    def crt_recombine_lagrange(x):
+  if cfs_period.exists() and cfs_quota.exists():
+    with cfs_period.open('rb') as p, cfs_quota.open('rb') as q:
+      p_int, q_int = int(p.read()), int(q.read())
 
-      with tf.name_scope('crt_recombine_lagrange'):
-        res = sum(xi * li for xi, li in zip(x, lambdas)) % modulus
-        res = res.astype(object)
-        return res
+      # get the cores allocated by dividing the quota
+      # in microseconds by the period in microseconds
+      if q_int > 0 and p_int > 0:
+        cpu_cores = math.ceil(q_int / p_int)
 
-    return crt_recombine_lagrange
+  return cpu_cores
 
-  def gen_crt_recombine_explicit():
 
-    # precomputation
-    q = [inverse(modulus // mi, mi) for mi in moduli]
+class Config(ABC):
+  """The main tfe.Config abstraction."""
 
-    def crt_recombine_explicit(x, bound):
+  @abstractmethod
+  def players(self):
+    """Returns the config's list of :class:`Player` objects."""
 
-      big_b = modulus % bound
-      b = [(modulus // mi) % bound for mi in moduli]
+  @abstractmethod
+  def get_player(self, name):
+    """Retrieve a specific :class:`Player` object by name."""
 
-      with tf.name_scope('crt_recombine_explicit'):
+  @abstractmethod
+  def get_tf_config(
+      self,
+      log_device_placement=False,
+      disable_optimizations=False
+  ):
+    """
+    get_tf_config(log_device_placement=False) -> tf.ConfigProto, or str
 
-        if isinstance(x[0], np.ndarray):
-          # backed by np.ndarray
-          t = [(xi * qi) % mi for xi, qi, mi in zip(x, q, moduli)]
-          alpha = np.round(
-              np.sum(
-                  [ti.astype(float) / mi for ti, mi in zip(t, moduli)],
-                  axis=0
-              ))
-          u = np.sum([ti * bi for ti, bi in zip(t, b)],
-                     axis=0).astype(np.int64)
-          v = alpha.astype(np.int64) * big_b
-          w = u - v
-          res = w % bound
-          res = res.astype(np.int32)
-          return res
+    Extract the underlying :class:`tf.ConfigProto`.
+    """
 
-        if isinstance(x[0], tf.Tensor):
-          # backed by tf.Tensor
-          t = [(xi * qi) % mi for xi, qi, mi in zip(x, q, moduli)]
-          alpha = tf.round(
-              tf.reduce_sum(
-                  [tf.cast(ti, tf.float32) / mi for ti, mi in zip(t, moduli)],
-                  axis=0
-              ))
-          u = tf.cast(tf.reduce_sum(
-              [ti * bi for ti, bi in zip(t, b)], axis=0), tf.int64)
-          v = tf.cast(alpha, tf.int64) * big_b
-          w = u - v
-          res = w % bound
-          res = tf.cast(res, int_type)
-          return res
-
-        raise TypeError("Don't know how to recombine {}".format(type(x[0])))
-
-    return crt_recombine_explicit
-
-  def gen_crt_mod():
-
-    # outer precomputation
-    q = [inverse(modulus // mi, mi) for mi in moduli]
-
-    def crt_mod(x, k):
-      assert isinstance(k, int), type(k)
-
-      # inner precomputations
-      big_b = modulus % k
-      b = [(modulus // mi) % k for mi in moduli]
-
-      with tf.name_scope('crt_mod'):
-        t = [(xi * qi) % mi for xi, qi, mi in zip(x, q, moduli)]
-        alpha = tf.round(
-            tf.reduce_sum(
-                [tf.cast(ti, tf.float32) / mi for ti, mi in zip(t, moduli)],
-                axis=0
-            )
-        )
-        u = tf.reduce_sum([ti * bi for ti, bi in zip(t, b)], axis=0)
-        v = tf.cast(alpha, int_type) * big_b
-        w = u - v
-        return w % k
-
-    return crt_mod
-
-  crt_recombine_lagrange = gen_crt_recombine_lagrange()
-  crt_recombine_explicit = gen_crt_recombine_explicit()
-  crt_mod = gen_crt_mod()
-
-  #
-  # methods used in more than one place
-  #
-
-  def _crt_decompose(x):
-    return [x % mi for mi in moduli]
-
-  def _crt_add(x, y):
-    return [(xi + yi) % mi for xi, yi, mi in zip(x, y, moduli)]
-
-  def _crt_sub(x, y):
-    return [(xi - yi) % mi for xi, yi, mi in zip(x, y, moduli)]
-
-  def _crt_mul(x, y):
-    return [(xi * yi) % mi for xi, yi, mi in zip(x, y, moduli)]
-
-  def _crt_matmul(x, y):
-    return [tf.matmul(xi, yi) % mi for xi, yi, mi in zip(x, y, moduli)]
-
-  def _construct_backing_from_chunks(chunk_sizes, chunk_values):
-    backing = _crt_decompose(0)
-    for chunk_size, chunk_value in zip(chunk_sizes, chunk_values):
-      scale = 2**chunk_size
-      backing = _crt_add(
-          _crt_mul(backing, _crt_decompose(scale)),
-          _crt_decompose(chunk_value)
-      )
-    return backing
-
-  class Factory(AbstractFactory):
-    """CRT tensor factory."""
-
-    def zero(self):
-      backing = [tf.constant(0, dtype=int_type)] * len(moduli)
-      return DenseTensor(backing)
-
-    def one(self):
-      backing = [tf.constant(1, dtype=int_type)] * len(moduli)
-      return DenseTensor(backing)
-
-    def sample_uniform(self,
-                       shape,
-                       minval: Optional[int] = None,
-                       maxval: Optional[int] = None):
-      assert minval is None
-      assert maxval is None
-
-      if secure_random.supports_seeded_randomness():
-        seeds = [secure_random.get_seed() for _ in moduli]
-        return UniformTensor(shape, seeds)
-
-      if secure_random.supports_secure_randomness():
-        backing = [secure_random.random_uniform(shape,
-                                                minval=0,
-                                                maxval=mi,
-                                                dtype=int_type)
-                   for mi in moduli]
-        return DenseTensor(backing)
-
-      backing = [tf.random_uniform(shape,
-                                   minval=0,
-                                   maxval=mi,
-                                   dtype=int_type)
-                 for mi in moduli]
-      return DenseTensor(backing)
-
-    def sample_bounded(self,
-                       shape,
-                       bitlength: int):
-
-      # TODO[Morten] bump to full range once signed numbers is settled (change minval etc)
-      chunk_max_bitlength = 30
-
-      q, r = bitlength // chunk_max_bitlength, bitlength % chunk_max_bitlength
-      chunk_sizes = [chunk_max_bitlength] * q + ([r] if r > 0 else [])
-
-      if secure_random.supports_seeded_randomness():
-        seeds = [secure_random.get_seed() for _ in chunk_sizes]
-        return BoundedTensor(shape=shape,
-                             seeds=seeds,
-                             chunk_sizes=chunk_sizes)
-
-      if secure_random.supports_secure_randomness():
-        sampler = secure_random.random_uniform
+    def build_graph_options(self, disable_optimizations):
+      if not disable_optimizations:
+        return tf.GraphOptions()
       else:
-        sampler = tf.random_uniform
-
-      chunk_values = [sampler(shape=shape,
-                              minval=0,
-                              maxval=2**chunk_size,
-                              dtype=int_type)
-                      for chunk_size in chunk_sizes]
-      backing = _construct_backing_from_chunks(chunk_sizes, chunk_values)
-      return DenseTensor(backing)
-
-    def stack(self, xs: list, axis: int = 0):
-      assert all(isinstance(x, Tensor) for x in xs)
-      backing = [tf.stack([x.backing[i] for x in xs], axis=axis)
-                 for i in range(len(xs[0].backing))]
-      return DenseTensor(backing)
-
-    def concat(self, xs: list, axis: int = 0):
-      assert all(isinstance(x, Tensor) for x in xs)
-      backing = [tf.concat([x.backing[i] for x in xs], axis=axis)
-                 for i in range(len(xs[0].backing))]
-      return DenseTensor(backing)
-
-    def tensor(self, value):
-
-      if isinstance(value, tf.Tensor):
-        backing = [tf.cast(component, dtype=int_type)
-                   for component in _crt_decompose(value)]
-        return DenseTensor(backing)
-
-      if isinstance(value, np.ndarray):
-        backing = [tf.convert_to_tensor(component, dtype=int_type)
-                   for component in _crt_decompose(value)]
-        return DenseTensor(backing)
-
-      raise TypeError(("Don't know how to handle ",
-                       "{}".format(type(value))))
-
-    def constant(self, value):
-
-      if isinstance(value, np.ndarray):
-        backing = [tf.constant(v, dtype=int_type)
-                   for v in _crt_decompose(value)]
-        return Constant(backing)
-
-      raise TypeError(("Don't know how to handle ",
-                       "{}".format(type(value))))
-
-    def variable(self, initial_value):
-
-      if isinstance(initial_value, (tf.Tensor, np.ndarray)):
-        return Variable(_crt_decompose(initial_value))
-
-      if isinstance(initial_value, Tensor):
-        return Variable(initial_value.backing)
-
-      raise TypeError(("Don't know how to handle ",
-                       "{}".format(type(initial_value))))
-
-    def placeholder(self, shape):
-      return Placeholder(shape)
-
-    @property
-    def modulus(self) -> int:
-      return modulus
-
-    @property
-    def native_type(self):
-      return int_type
-
-  master_factory = Factory()
-
-  def _lift(x, y) -> Tuple['Tensor', 'Tensor']:
-
-    if isinstance(x, Tensor) and isinstance(y, Tensor):
-      return x, y
-
-    if isinstance(x, Tensor):
-
-      if isinstance(y, int):
-        return x, x.factory.tensor(np.array([y]))
-
-    if isinstance(y, Tensor):
-
-      if isinstance(x, int):
-        return y.factory.tensor(np.array([x])), y
-
-    raise TypeError("Don't know how to lift {} {}".format(type(x), type(y)))
-
-  class Tensor(AbstractTensor):
-    """Base class for other CRT tensor classes."""
-
-    @abc.abstractproperty
-    @property
-    def backing(self):
-      pass
-
-    @abc.abstractproperty
-    @property
-    def shape(self):
-      pass
-
-    @property
-    def modulus(self):
-      return modulus
-
-    @property
-    def factory(self):
-      return master_factory
-
-    def to_native(self) -> Union[tf.Tensor, np.ndarray]:
-      return crt_recombine_explicit(self.backing, 2**32)
-
-    def bits(
-        self,
-        factory: Optional[AbstractFactory] = None,
-        ensure_positive_interpretation: bool = False
-    ) -> AbstractTensor:
-      """Convert to a pure bits representation."""
-
-      factory = factory or self.factory
-
-      with tf.name_scope('to_bits'):
-
-        # we will extract the bits in chunks of 16 as that's reasonable for the explicit CRT
-        max_chunk_bitsize = 16
-        q, r = bitsize // max_chunk_bitsize, bitsize % max_chunk_bitsize
-        chunk_bitsizes = [max_chunk_bitsize] * q + ([r] if r > 0 else [])
-        chunks_modulus = [2**bitsize for bitsize in chunk_bitsizes]
-
-        remaining = self
-
-        if ensure_positive_interpretation:
-
-          # To get the right bit pattern for negative numbers we need to apply a correction
-          # to the first chunk. Unfortunately, this isn't known until all bits have been
-          # extracted and hence we extract bits both with and without the correction and
-          # select afterwards. Although these two versions could be computed independently
-          # we here combine them into a single tensor to keep the graph smaller.
-
-          shape = self.shape.as_list()
-          shape_value = [1] + shape
-          shape_correction = [2] + [1] * len(shape)
-
-          # this means that chunk[0] is uncorrected and chunk[1] is corrected
-          correction_raw = [0, self.modulus % chunks_modulus[0]]
-          correction = tf.constant(correction_raw,
-                                   shape=shape_correction,
-                                   dtype=self.factory.native_type)
-
-          remaining = remaining.reshape(shape_value)
-
-        # extract chunks
-        chunks = []
-        apply_correction = ensure_positive_interpretation
-        for chunk_modulus in chunks_modulus:
-
-          # extract chunk from remaining
-          chunk = crt_mod(remaining.backing, chunk_modulus)
-
-          # apply correction only to the first chunk
-          if apply_correction:
-            chunk = (chunk + correction) % chunk_modulus
-            apply_correction = False
-
-          # save for below
-          chunks.append(chunk)
-
-          # perform right shift on remaining
-          shifted = (remaining - master_factory.tensor(chunk))
-          remaining = shifted * inverse(chunk_modulus, self.modulus)
-
-        if ensure_positive_interpretation:
-          # pick between corrected and uncorrected based on MSB
-          msb = chunks[-1][0] >= (chunks_modulus[-1]) // 2
-          chunks = [
-              tf.where(
-                  msb,
-                  chunk[1],  # corrected
-                  chunk[0],  # uncorrected
-              )
-              for chunk in chunks
-          ]
-
-        # extract bits from chunks
-        chunks_bits = [
-            binarize(chunk, chunk_bitsize)
-            for chunk, chunk_bitsize in zip(chunks, chunk_bitsizes)
-        ]
-
-        # combine bits of chunks
-        bits = tf.concat(chunks_bits, axis=-1)
-
-        return factory.tensor(bits)
-
-    def to_bigint(self) -> np.ndarray:
-      return crt_recombine_lagrange(self.backing)
-
-    def __getitem__(self, slc):
-      return DenseTensor([x[slc] for x in self.backing])
-
-    def __repr__(self) -> str:
-      return 'Tensor({})'.format(self.shape)
-
-    def __add__(self, other):
-      x, y = _lift(self, other)
-      return x.add(y)
-
-    def __radd__(self, other):
-      x, y = _lift(self, other)
-      return x.add(y)
-
-    def __sub__(self, other):
-      x, y = _lift(self, other)
-      return x.sub(y)
-
-    def __rsub__(self, other):
-      x, y = _lift(self, other)
-      return x.sub(y)
-
-    def __mul__(self, other):
-      x, y = _lift(self, other)
-      return x.mul(y)
-
-    def __rmul__(self, other):
-      x, y = _lift(self, other)
-      return x.mul(y)
-
-    def __mod__(self, k: int):
-      return self.mod(k)
-
-    def add(self, other):
-      x, y = _lift(self, other)
-      return DenseTensor(_crt_add(x.backing, y.backing))
-
-    def sub(self, other):
-      x, y = _lift(self, other)
-      return DenseTensor(_crt_sub(x.backing, y.backing))
-
-    def mul(self, other):
-      x, y = _lift(self, other)
-      return DenseTensor(_crt_mul(x.backing, y.backing))
-
-    def matmul(self, other):
-      """Matmul with other."""
-      x, y = _lift(self, other)
-
-      if x.shape[1] <= matmul_threshold:
-        # perform matmul directly (we have enough room)
-        z_backing = _crt_matmul(x.backing, y.backing)
-        return DenseTensor(z_backing)
-
-      # we need to split the tensors, process independently, and then recombine
-
-      with tf.name_scope('split'):
-        z_split = []
-
-        num_columns = int(x.backing[0].shape[1])
-        num_split = int(math.ceil(num_columns / matmul_threshold))
-        for i in range(num_split):
-
-          left = i * matmul_threshold
-          right = (i + 1) * matmul_threshold
-
-          inner_x = []  # type: List[Union[tf.Tensor, np.ndarray]]
-          inner_y = []  # type: List[Union[tf.Tensor, np.ndarray]]
-
-          for xi, yi in zip(x.backing, y.backing):
-            inner_x.append(xi[:, left:right])
-            inner_y.append(yi[left:right, :])
-
-          z_split.append((inner_x, inner_y))
-
-      with tf.name_scope('recombine'):
-        split_products = [_crt_matmul(xi, yi) for xi, yi in z_split]
-        z_backing = reduce(_crt_add, split_products)
-
-      return DenseTensor(z_backing)
-
-    def mod(self, k: int):
-      backing = _crt_decompose(crt_mod(self.backing, k))
-      return DenseTensor(backing)
-
-    def reduce_sum(self, axis, keepdims=None):
-      with tf.name_scope('crt_reduce_sum'):
-        backing = [tf.reduce_sum(xi, axis, keepdims) % mi
-                   for xi, mi in zip(self.backing, moduli)]
-        return DenseTensor(backing)
-
-    def cumsum(self, axis, exclusive, reverse):
-      with tf.name_scope('crt_cumsum'):
-        backing = [tf.cumsum(xi,
-                             axis=axis,
-                             exclusive=exclusive,
-                             reverse=reverse) % mi
-                   for xi, mi in zip(self.backing, moduli)]
-        return DenseTensor(backing)
-
-    def equal_zero(self, factory=None):
-      """Check equality with zero."""
-      factory = factory or master_factory
-
-      with tf.name_scope('crt_equal_zero'):
-        zeros = [tf.cast(tf.equal(xi, 0), factory.native_type)
-                 for xi in self.backing]
-        number_of_zeros = tf.reduce_sum(zeros, axis=0)
-        backing = tf.equal(number_of_zeros, len(moduli))
-        all_zeros = tf.cast(backing, factory.native_type)
-
-      return factory.tensor(all_zeros)
-
-    def equal(self, other, factory=None):
-      """Check equality with other."""
-      x, y = _lift(self, other)
-      factory = factory or x.factory
-
-      with tf.name_scope('crt_equal'):
-        matches = [tf.cast(tf.equal(xi, yi), factory.native_type)
-                   for xi, yi in zip(x.backing, y.backing)]
-        number_of_matches = tf.reduce_sum(matches, axis=0)
-        backing = tf.equal(number_of_matches, len(moduli))
-        all_matches = tf.cast(backing, factory.native_type)
-
-      return factory.tensor(all_matches)
-
-    def im2col(self, h_filter: int, w_filter: int, padding: str, stride: int):
-      with tf.name_scope('crt_im2col'):
-        backing = [im2col(xi,
-                          h_filter=h_filter,
-                          w_filter=w_filter,
-                          padding=padding,
-                          stride=stride)
-                   for xi in self.backing]
-        return DenseTensor(backing)
-
-    def conv2d(self, other, stride: int, padding: str = 'SAME'):
-      x, y = _lift(self, other)
-      return conv2d(x, y, stride, padding)  # type: ignore
-
-    def batch_to_space_nd(self, block_shape, crops):
-      with tf.name_scope("crt_batch_to_space_nd"):
-        backing = [tf.batch_to_space_nd(xi,
-                                        block_shape=block_shape,
-                                        crops=crops)
-                   for xi in self.backing]
-        return DenseTensor(backing)
-
-    def space_to_batch_nd(self, block_shape, paddings):
-      with tf.name_scope("crt_space_to_batch_nd"):
-        backing = [tf.space_to_batch_nd(xi,
-                                        block_shape=block_shape,
-                                        paddings=paddings)
-                   for xi in self.backing]
-        return DenseTensor(backing)
-
-    def transpose(self, perm):
-      backing = [tf.transpose(xi, perm=perm) for xi in self.backing]
-      return DenseTensor(backing)
-
-    def strided_slice(self, args, kwargs):
-      backing = [tf.strided_slice(xi, *args, **kwargs) for xi in self.backing]
-      return DenseTensor(backing)
-
-    def split(self, num_split: int, axis: int = 0):
-      backings = zip(*[tf.split(xi, num_split, axis=axis)
-                       for xi in self.backing])
-      return [DenseTensor(backing) for backing in backings]
-
-    def reshape(self, axes: List[int]):
-      backing = [tf.reshape(xi, axes) for xi in self.backing]
-      return DenseTensor(backing)
-
-    def negative(self):
-      backing = [tf.negative(xi) % mi for xi, mi in zip(self.backing, moduli)]
-      return DenseTensor(backing)
-
-    def expand_dims(self, axis: Optional[int] = None):
-      backing = [tf.expand_dims(xi, axis) for xi in self.backing]
-      return DenseTensor(backing)
-
-    def squeeze(self, axis: Optional[List[int]] = None):
-      backing = [tf.squeeze(xi, axis=axis) for xi in self.backing]
-      return DenseTensor(backing)
-
-    def truncate(self, amount, base=2):
-      factor = base**amount
-      factor_inverse = inverse(factor, modulus)
-      return (self - (self % factor)) * factor_inverse
-
-    def right_shift(self, bitlength):
-      return self.truncate(bitlength, 2)
-
-    def cast(self, factory):
-      # NOTE(Morten) could add more convertion options
-      if factory is self.factory:
-        return self
-      raise ValueError("Don't know how to cast into {}".format(factory))
-
-  class DenseTensor(Tensor):
-    """Public CRT Tensor class."""
-
-    def __init__(self, backing):
-      self._backing = backing
-
-    @property
-    def shape(self):
-      return self._backing[0].shape
-
-    @property
-    def backing(self):
-      return self._backing
-
-  class UniformTensor(Tensor):
-    """Class representing a uniform-random, lazily sampled tensor.
-
-    Lazy sampling optimizes communication by sending seeds in place of
-    fully-expanded tensors."""
-
-    def __init__(self, shape, seeds):
-      self._seeds = seeds
-      self._shape = shape
-
-    @property
-    def shape(self):
-      return self._shape
-
-    @property
-    def backing(self):
-      with tf.name_scope('expand-seed'):
-        return [secure_random.seeded_random_uniform(self._shape,
-                                                    minval=0,
-                                                    maxval=mi,
-                                                    seed_int=seed,
-                                                    dtype=int_type)
-                for (mi, seed) in zip(moduli, self._seeds)]
-
-  class BoundedTensor(Tensor):
-    """CRT bounded-randomness tensor."""
-
-    def __init__(self, shape, seeds, chunk_sizes):
-      self._shape = shape
-      self._seeds = seeds
-      self._chunk_sizes = chunk_sizes
-
-    @property
-    def shape(self):
-      return self._shape
-
-    @property
-    def backing(self):
-      with tf.name_scope('expand-seed'):
-        sampler = partial(secure_random.seeded_random_uniform,
-                          self._shape,
-                          minval=0,
-                          dtype=int_type)
-        zipped = zip(self._chunk_sizes, self._seeds)
-        chunk_values = [sampler(maxval=2 ** chunk_size, seed_int=seed_value)
-                        for chunk_size, seed_value in zipped]
-        return _construct_backing_from_chunks(self._chunk_sizes, chunk_values)
-
-  class Constant(DenseTensor, AbstractConstant):
-    """CRT Constant class."""
-
-    def __init__(self, backing) -> None:
-      assert all(isinstance(component, tf.Tensor) for component in backing)
-      super(Constant, self).__init__(backing)
-
-    def __repr__(self) -> str:
-      return 'Constant({})'.format(self.shape)
-
-  class Placeholder(DenseTensor, AbstractPlaceholder):
-    """CRT Placeholder class."""
-
-    def __init__(self, shape) -> None:
-      self.placeholders = [tf.placeholder(int_type, shape=shape)
-                           for _ in moduli]
-      super(Placeholder, self).__init__(self.placeholders)
-
-    def __repr__(self):
-      return 'Placeholder({})'.format(self.shape)
-
-    def feed(self, value):
-      assert isinstance(value, np.ndarray), type(value)
-      backing = _crt_decompose(value)
-      return {
-          p: v for p, v in zip(self.placeholders, backing)
-      }
-
-  class Variable(DenseTensor, AbstractVariable):
-    """CRT Variable class."""
-
-    def __init__(self, initial_backing) -> None:
-      self.variables = [tf.Variable(val,
-                                    dtype=int_type,
-                                    trainable=False)
-                        for val in initial_backing]
-      self.initializer = tf.group(*[var.initializer for var in self.variables])
-      backing = [var.read_value() for var in self.variables]
-      super(Variable, self).__init__(backing)
-
-    def __repr__(self):
-      return 'Variable({})'.format(self.shape)
-
-    def assign_from_native(self, value: np.ndarray):
-      assert isinstance(value, np.ndarray), type(value)
-      return self.assign_from_same(master_factory.tensor(value))
-
-    def assign_from_same(self, value: Tensor):
-      assert isinstance(value, Tensor), type(value)
-      assign_ops = [tf.assign(xi, vi).op
-                    for xi, vi in zip(self.variables, value.backing)]
-      return tf.group(*assign_ops)
-
-  return master_factory
-
-
-#
-# 32 bit CRT
-# - we need this to do matmul as int32 is the only supported type for that
-# - tried tf.float64 but didn't work out of the box
-# - 10 components for modulus ~100 bits
-#
-
-int100factory = crt_factory(
-    int_type=tf.int32,
-    moduli=[1201, 1433, 1217, 1237, 1321, 1103, 1129, 1367, 1093, 1039],
-)
+        return tf.GraphOptions(
+            optimizer_options=tf.OptimizerOptions(
+                opt_level=tf.OptimizerOptions.L0,
+                do_common_subexpression_elimination=False,
+                do_constant_folding=False,
+                do_function_inlining=False,
+            ),
+            rewrite_options=rewriter_config_pb2.RewriterConfig(
+                arithmetic_optimization=rewriter_config_pb2.RewriterConfig.OFF,
+            ),
+        )
+
+
+class LocalConfig(Config):
+  """
+  Configure TF Encrypted to use threads on the local CPU.
+
+  Each thread instantiates a different Player to simulate secure computations
+  without requiring networking. Mostly intended for development/debugging use.
+
+  By default new players will be added when looked up for the first time;
+  this is useful for  instance to get a complete list of players involved
+  in a particular computation (see `auto_add_unknown_players`).
+
+  :param (str) player_names: List of players to be used in the session.
+  :param str job_name: The name of the job.
+  :param bool auto_add_unknown_players: Auto-add player on first lookup.
+  """
+
+  def __init__(
+      self,
+      player_names=None,
+      job_name='localhost',
+      auto_add_unknown_players=True,
+  ) -> None:
+    self._job_name = job_name
+    self._auto_add_unknown_players = auto_add_unknown_players
+    self._players = []
+    if player_names is None:
+      player_names = []
+    for name in player_names:
+      self.add_player(name)
+
+  def add_player(self, name):
+    index = len(self._players)
+    dv_str = '/job:{job_name}/replica:0/task:0/device:CPU:{cpu_id}'
+    player = Player(
+        name=name,
+        index=index,
+        device_name=dv_str.format(job_name=self._job_name, cpu_id=index),
+    )
+    self._players.append(player)
+    return player
+
+  @property
+  def players(self):
+    return self._players
+
+  def get_player(self, name):
+    player = next(
+        (player for player in self._players if player.name == name), None)
+    if player is None and self._auto_add_unknown_players:
+      player = self.add_player(name)
+    return player
+
+  def get_players(self, names):
+    if isinstance(names, str):
+      names = [name.strip() for name in names.split(',')]
+    assert isinstance(names, list)
+    return [player for player in self._players if player.name in names]
+
+  def get_tf_config(
+      self,
+      log_device_placement=False,
+      disable_optimizations=False
+  ):
+    logger.info("Players: %s", [player.name for player in self.players])
+    target = ''
+    config = tf.ConfigProto(
+        log_device_placement=log_device_placement,
+        allow_soft_placement=False,
+        device_count={"CPU": len(self._players)},
+        graph_options=self.build_graph_options(disable_optimizations)
+    )
+    return (target, config)
+
+
+class RemoteConfig(Config):
+  """
+  Configure TF Encrypted to use network hosts for the different players.
+
+  :param (str,str),str->str hostmap: A mapping of hostnames to
+      their IP / domain.
+  :param str job_name: The name of the job.
+  """
+
+  def __init__(
+      self,
+      hostmap,
+      job_name='tfe',
+  ):
+    assert isinstance(hostmap, dict)
+    if not isinstance(hostmap, OrderedDict):
+      logger.warning(
+          "Consider passing an ordered dictionary to RemoteConfig instead"
+          "in order to preserve host mapping.")
+
+    self._job_name = job_name
+    self._players = OrderedDict(
+        (name, Player(
+            name=name,
+            index=index,
+            device_name='/job:{job_name}/replica:0/task:{task_id}/cpu:0'.format(
+                job_name=job_name,
+                task_id=index
+            ),
+            host=host
+        ))
+        for index, (name, host) in enumerate(hostmap.items())
+    )
+
+  @staticmethod
+  def load(filename):
+    """
+    Constructs a RemoteConfig object from a JSON hostmap file.
+
+    :param str filename: Name of file to load from.
+    """
+    with open(filename, 'r') as f:
+      hostmap = json.load(f, object_pairs_hook=OrderedDict)
+    return RemoteConfig(hostmap)
+
+  def save(self, filename):
+    """
+    Saves the configuration as a JSON hostmap file.
+
+    :param str filename: Name of file to save to.
+    """
+    with open(filename, 'w') as f:
+      json.dump(self.hostmap, f)
+
+  @property
+  def hostmap(self):
+    return OrderedDict(
+        (player.name, player.host)
+        for player in self._players.values()
+    )
+
+  @property
+  def hosts(self):
+    return [
+        player.host
+        for player in self._players.values()
+    ]
+
+  @property
+  def players(self):
+    return list(self._players.values())
+
+  def get_player(self, name):
+    return self._players.get(name)
+
+  def get_players(self, names):
+    if isinstance(names, str):
+      names = [name.strip() for name in names.split(',')]
+    assert isinstance(names, list)
+    return [player for name, player in self._players.items() if name in names]
+
+  def server(self, name, start=True):
+    """
+    Construct a :class:`tf.train.Server` object for the corresponding
+    :class:`Player`.
+
+    :param str name: Name of player.
+    """
+    player = self.get_player(name)
+    assert player is not None, "'{}' not found in configuration".format(name)
+    cluster = tf.train.ClusterSpec({self._job_name: self.hosts})
+    logger.debug("Creating server for '%s' using %s", name, cluster)
+    server = tf.train.Server(
+        cluster,
+        job_name=self._job_name,
+        task_index=player.index,
+        start=start)
+    logger.info(("Created server for '%s' as device '%s'; "
+                 "own session target is '%s'"),
+                name, player.device_name, server.target)
+    return server
+
+  def get_tf_config(
+      self,
+      log_device_placement=False,
+      disable_optimizations=False
+  ):
+    # always use the first host as master; change config to match
+    target = 'grpc://{}'.format(self.hosts[0])
+    cpu_cores = _get_docker_cpu_quota()
+    if cpu_cores is None:
+      config = tf.ConfigProto(
+          log_device_placement=log_device_placement,
+          allow_soft_placement=False,
+          graph_options=self.build_graph_options(disable_optimizations)
+      )
+    else:
+      config = tf.ConfigProto(
+          log_device_placement=log_device_placement,
+          allow_soft_placement=False,
+          inter_op_parallelism_threads=cpu_cores,
+          intra_op_parallelism_threads=cpu_cores,
+          graph_options=self.build_graph_options(disable_optimizations)
+      )
+    return (target, config)
+
+
+__config__ = LocalConfig()
+
+
+def get_config():
+  """Returns the current config."""
+  return __config__
+
+
+def set_config(config) -> None:
+  """
+  Sets the current config.
+
+  :param Config config: Intended configuration.
+  """
+  global __config__
+  __config__ = config
