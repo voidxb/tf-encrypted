@@ -3,7 +3,7 @@ import random
 
 import tensorflow as tf
 
-from ...utils import wrap_in_variables
+from ...utils import wrap_in_variables, reachable_nodes
 
 
 class TripleSource(abc.ABC):
@@ -17,7 +17,7 @@ class TripleSource(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def generate_triples(self, sess, fetches, tag=None):
+    def generate_triples(self, fetches):
         pass
 
 
@@ -188,34 +188,52 @@ class OnlineTripleSource(BaseTripleSource):
     def __init__(self, producer):
         super().__init__(None, None, producer)
 
+    def cache(self, a):
+        with tf.device(self.producer.device_name):
+            updater, [a_cached] = wrap_in_variables(a)
+        return updater, a_cached
+
     def initialize(self, sess, tag=None):
         pass
 
-    def generate_triples(self, sess, fetches, tag=None):
-        pass
+    def generate_triples(self, fetches):
+        return []
+
+    def _build_queues(self, c0, c1):
+        return c0, c1
+
+
+class QueuedOnlineTripleSource(BaseTripleSource):
+    """
+    Similar to `OnlineTripleSource` but with in-memory buffering backed by
+    `tf.FIFOQueue`s.
+    """
+
+    def __init__(self, player0, player1, producer, capacity=10):
+        super().__init__(player0, player1, producer)
+        self.capacity = capacity
+        self.enqueuers = dict()
 
     def cache(self, a):
         with tf.device(self.producer.device_name):
             updater, [a_cached] = wrap_in_variables(a)
         return updater, a_cached
 
-    def _build_queues(self, c0, c1):
-        return c0, c1
+    def initialize(self, sess, tag=None):
+        pass
 
-
-"""
-class QueuedTripleSource(BaseTripleSource):
-
-    # TODO(Morten) manually unwrap and re-wrap of queued values, should be hidden away
-
-    def __init__(self, player0, player1, producer, capacity=10):
-        super().__init__(player0, player1, producer)
-        self.capacity = capacity
-        self.enqueuers = list()
-        self.sizes = list()
+    def generate_triples(self, fetches):
+        reachable_operations = [node
+                                for node in reachable_nodes(fetches)
+                                if isinstance(node, tf.Operation)]
+        reachable_enqueuers = [self.enqueuers[op]
+                               for op in reachable_operations
+                               if op in self.enqueuers]
+        return reachable_enqueuers
 
     def _build_triple_store(self, mask):
 
+        # TODO(Morten) taking `value` doesn't work for int100
         raw_mask = mask.value
         factory = mask.factory
         dtype = mask.factory.native_type
@@ -229,33 +247,21 @@ class QueuedTripleSource(BaseTripleSource):
                 shapes=[shape],
             )
             e = q.enqueue(raw_mask)
-            d = factory.tensor(q.dequeue())
+            d = q.dequeue()
+            d_wrapped = factory.tensor(d)
 
-        return e, d
+        self.enqueuers[d.op] = e
+        return d_wrapped
 
     def _build_queues(self, c0, c1):
 
         with tf.device(self.player0.device_name):
-            e0, d0 = self._build_triple_store(c0)
+            d0 = self._build_triple_store(c0)
 
         with tf.device(self.player1.device_name):
-            e1, d1 = self._build_triple_store(c1)
+            d1 = self._build_triple_store(c1)
 
-        self.enqueuers += [e0, e1]
         return d0, d1
-
-    def cache(self, a):
-        with tf.device(self.producer.device_name):
-            updater, [a_cached] = wrap_in_variables(a)
-        return updater, a_cached
-
-    def initialize(self, sess, tag=None):
-        pass
-
-    def generate_triples(self, sess, fetches, tag=None):
-        # TODO(Morten) filter which enqueuers to run given fetches
-        sess.run(self.enqueuers, tag=tag)
-"""
 
 
 """

@@ -26,7 +26,7 @@ from ...types import Slice, Ellipse
 from ...player import Player
 from ...config import get_config, tensorflow_supports_int64
 from ..protocol import Protocol, memoize, nodes
-from .triple_sources import OnlineTripleSource
+from .triple_sources import OnlineTripleSource, QueuedOnlineTripleSource
 
 
 TFEData = Union[np.ndarray, tf.Tensor]
@@ -62,12 +62,19 @@ class Pond(Protocol):
         crypto_producer: Optional[Player] = None,
         tensor_factory: Optional[AbstractFactory] = None,
         fixedpoint_config: Optional[FixedpointConfig] = None,
+        queued_triple_generation=False,
     ) -> None:
         self.server_0 = server_0 or get_config().get_player("server0")
         self.server_1 = server_1 or get_config().get_player("server1")
+        
         crypto_producer = crypto_producer or get_config().get_player("server2")
         crypto_producer = crypto_producer or get_config().get_player("crypto-producer")
-        self.triple_source = OnlineTripleSource(crypto_producer)
+        if queued_triple_generation:
+            self.triple_source = QueuedOnlineTripleSource(self.server_0,
+                                                          self.server_1,
+                                                          crypto_producer)
+        else:
+            self.triple_source = OnlineTripleSource(crypto_producer)
 
         if tensor_factory is None:
             if tensorflow_supports_int64():
