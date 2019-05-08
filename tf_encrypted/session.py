@@ -199,6 +199,21 @@ def set_tfe_trace_flag(trace: bool = False) -> None:
   """
   global __tfe_trace__
   if trace is True:
-    print("Tensorflow encrypted is dumping computation traces")
+    logger.info("Tensorflow encrypted is dumping computation traces")
 
   __tfe_trace__ = trace
+
+
+def set_log_directory(path):
+  """
+  set_log_directory(path)
+
+  Sets the directory to write TensorBoard event and trace files to.
+
+  :param str path: The TensorBoard logdir.
+  """
+  global __tensorboard_dir__
+  if path:
+    logger.info("Writing event and trace files to '%s'", path)
+
+  __tensorboard_dir__ = path

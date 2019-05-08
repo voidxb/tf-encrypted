@@ -5,7 +5,6 @@ import inspect
 
 from .protocol import (
     Protocol,
-    global_caches_updater,
     memoize,
     set_protocol,
     get_protocol,
@@ -34,7 +33,6 @@ def get_all_funcs():
 
 __all__ = [
     "Protocol",
-    "global_caches_updater",
     "memoize",
     "Pond",
     "SecureNN",

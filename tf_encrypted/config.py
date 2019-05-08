@@ -76,21 +76,22 @@ class Config(ABC):
     Extract the underlying :class:`tf.ConfigProto`.
     """
 
-    def build_graph_options(self, disable_optimizations):
-      if not disable_optimizations:
-        return tf.GraphOptions()
-      else:
-        return tf.GraphOptions(
-            optimizer_options=tf.OptimizerOptions(
-                opt_level=tf.OptimizerOptions.L0,
-                do_common_subexpression_elimination=False,
-                do_constant_folding=False,
-                do_function_inlining=False,
-            ),
-            rewrite_options=rewriter_config_pb2.RewriterConfig(
-                arithmetic_optimization=rewriter_config_pb2.RewriterConfig.OFF,
-            ),
-        )
+  @classmethod
+  def build_graph_options(cls, disable_optimizations):
+    if not disable_optimizations:
+      return tf.GraphOptions()
+
+    return tf.GraphOptions(
+        optimizer_options=tf.OptimizerOptions(
+            opt_level=tf.OptimizerOptions.L0,
+            do_common_subexpression_elimination=False,
+            do_constant_folding=False,
+            do_function_inlining=False,
+        ),
+        rewrite_options=rewriter_config_pb2.RewriterConfig(
+            arithmetic_optimization=rewriter_config_pb2.RewriterConfig.OFF,
+        ),
+    )
 
 
 class LocalConfig(Config):

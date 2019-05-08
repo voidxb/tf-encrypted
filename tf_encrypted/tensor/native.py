@@ -185,7 +185,6 @@ def native_factory(native_type, explicit_modulus=None):
       bitsize = bitsize = math.ceil(math.log2(explicit_modulus))
       return factory.tensor(binarize(self.value % explicit_modulus, bitsize))
 
-
     def __repr__(self) -> str:
       return '{}(shape={})'.format(type(self), self.shape)
 
